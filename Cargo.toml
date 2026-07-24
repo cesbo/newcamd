@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "newcamd_lib",
+  "ecm-reader",
+]
+resolver = "2"
