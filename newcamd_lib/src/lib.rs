@@ -3,5 +3,9 @@ mod crypto;
 mod error;
 mod protocol;
 
-pub use client::{CardData, EcmRequest, EcmResponse, NewcamdClient, NewcamdConfig, RawRequest};
+pub use client::{
+    CardData, Client, Connection, EcmRequest, EcmResponse, NewcamdConfig, RawRequest,
+};
 pub use error::{NewcamdError, Result};
+
+pub type NewcamdClient = Client;

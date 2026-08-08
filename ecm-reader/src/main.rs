@@ -1,12 +1,9 @@
 use anyhow::ensure;
 use clap::Parser;
-use libmpegts::{
-    psi::Psi,
-    slicer::TsSlicer,
-};
+use libmpegts::{psi::Psi, slicer::TsSlicer};
 use std::time::Duration;
 
-use newcamd_lib::{EcmRequest, NewcamdClient, NewcamdConfig};
+use newcamd_lib::{Client, EcmRequest, NewcamdConfig};
 
 #[derive(Parser)]
 #[command(about = "Read ECM sections from an MPEG-TS stream over HTTP")]
@@ -68,23 +65,24 @@ async fn main() -> anyhow::Result<()> {
     let des_key_14 = parse_des_key_14(&des_key_hex).map_err(|e| anyhow::anyhow!(e))?;
 
     let os_cam_config: NewcamdConfig = NewcamdConfig {
-            host: oscam_host,
-            port: oscam_port,
-            username: oscam_username,
-            password: oscam_password,
-            des_key_14: des_key_14,
-            caid,
-            provider,
-            connect_timeout: Duration::from_secs(5),
-            read_timeout: Duration::from_secs(5),
-        };
+        host: oscam_host,
+        port: oscam_port,
+        username: oscam_username,
+        password: oscam_password,
+        des_key_14,
+        caid,
+        provider,
+        connect_timeout: Duration::from_secs(5),
+        read_timeout: Duration::from_secs(5),
+    };
 
-
-    match NewcamdClient::connect(os_cam_config).await {
-        Ok(mut client) => {
+    match Client::connect(os_cam_config).await {
+        Ok((client, connection)) => {
             println!("Connected");
-            println!("Card CAID: 0x{:04X}", client.card_data.caid);
-            println!("Providers: {}", client.card_data.provider_count);
+            println!("Card CAID: 0x{:04X}", connection.card_data.caid);
+            println!("Providers: {}", connection.card_data.provider_count);
+
+            let connection_task = tokio::spawn(async move { connection.run().await });
 
             let mut response = reqwest::get(&args.url).await?.error_for_status()?;
             let mut slicer = TsSlicer::new();
@@ -130,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            connection_task.abort();
+            let _ = connection_task.await;
         }
         Err(err) => {
             eprintln!("Connection failed: {err}");

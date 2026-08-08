@@ -1,7 +1,9 @@
 use std::env;
 use std::time::Duration;
 
-use newcamd_lib::{EcmRequest, NewcamdClient, NewcamdConfig};
+use tokio::task::yield_now;
+
+use newcamd_lib::{Client, EcmRequest, NewcamdConfig};
 
 struct CliArgs {
     config: NewcamdConfig,
@@ -48,7 +50,9 @@ fn parse_hex_bytes(raw: &str, name: &str) -> Result<Vec<u8>, String> {
         return Err(format!("{name} must not be empty"));
     }
     if compact.len() % 2 != 0 {
-        return Err(format!("{name} must contain an even number of hex characters"));
+        return Err(format!(
+            "{name} must contain an even number of hex characters"
+        ));
     }
 
     let mut out = Vec::with_capacity(compact.len() / 2);
@@ -159,7 +163,10 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     }
 
     if username.is_empty() || password.is_empty() || des_key_hex.is_empty() {
-        return Err(format!("required arguments are missing\n{}", usage(&program)));
+        return Err(format!(
+            "required arguments are missing\n{}",
+            usage(&program)
+        ));
     }
 
     let des_key_14 = cli_helpers::parse_des_key_14(&des_key_hex)?;
@@ -184,20 +191,21 @@ fn parse_cli_args() -> Result<CliArgs, String> {
 
 mod cli_helpers {
     pub fn parse_des_key_14(hex: &str) -> Result<[u8; 14], String> {
-    if hex.len() != 28 {
-        return Err("NEWCAMD_DES_KEY_HEX must be exactly 28 hex chars (14 bytes)".to_string());
-    }
+        if hex.len() != 28 {
+            return Err("NEWCAMD_DES_KEY_HEX must be exactly 28 hex chars (14 bytes)".to_string());
+        }
 
-    let mut out = [0_u8; 14];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let from = i * 2;
-        let to = from + 2;
-        let chunk = &hex[from..to];
-        *slot = u8::from_str_radix(chunk, 16)
-            .map_err(|_| format!("invalid hex byte '{}' at positions {}..{}", chunk, from, to))?;
-    }
+        let mut out = [0_u8; 14];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let from = i * 2;
+            let to = from + 2;
+            let chunk = &hex[from..to];
+            *slot = u8::from_str_radix(chunk, 16).map_err(|_| {
+                format!("invalid hex byte '{}' at positions {}..{}", chunk, from, to)
+            })?;
+        }
 
-    Ok(out)
+        Ok(out)
     }
 }
 
@@ -211,11 +219,13 @@ async fn main() {
         }
     };
 
-    match NewcamdClient::connect(args.config).await {
-        Ok(mut client) => {
+    match Client::connect(args.config).await {
+        Ok((client, connection)) => {
             println!("Connected");
-            println!("Card CAID: 0x{:04X}", client.card_data.caid);
-            println!("Providers: {}", client.card_data.provider_count);
+            println!("Card CAID: 0x{:04X}", connection.card_data.caid);
+            println!("Providers: {}", connection.card_data.provider_count);
+
+            let connection_task = tokio::spawn(async move { connection.run().await });
 
             let mut ran_test = false;
 
@@ -246,15 +256,8 @@ async fn main() {
                 ran_test = true;
                 println!("Sending EMM test packet ({} bytes)...", section.len());
                 match client.send_emm(&section, args.sid, 0, 0).await {
-                    Ok(Some(packet)) => {
-                        println!(
-                            "EMM test acknowledged with command 0x{:02X} ({} bytes)",
-                            packet.command,
-                            packet.data.len()
-                        );
-                    }
-                    Ok(None) => {
-                        println!("EMM test sent, no explicit EMM ack packet received");
+                    Ok(()) => {
+                        println!("EMM test sent");
                     }
                     Err(err) => {
                         eprintln!("EMM test failed: {err}");
@@ -265,6 +268,10 @@ async fn main() {
             if !ran_test {
                 println!("No ECM/EMM test packet specified. Use --ecm <hex> and/or --emm <hex>.");
             }
+
+            yield_now().await;
+            connection_task.abort();
+            let _ = connection_task.await;
         }
         Err(err) => {
             eprintln!("Connection failed: {err}");

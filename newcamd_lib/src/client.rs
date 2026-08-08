@@ -1,7 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::crypto::{decrypt_message, derive_login_key, encrypt_message, md5_crypt};
@@ -11,6 +13,9 @@ use crate::protocol::{
     CWS_NETMSGSIZE, HEADER_SIZE_525, LOGIN_INIT_SEQ_LEN, NewcamdPacket, encode_payload,
     parse_decrypted_525, patch_payload_len,
 };
+
+const ECM_QUEUE_CAPACITY: usize = 1;
+const EMM_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct NewcamdConfig {
@@ -70,100 +75,91 @@ pub struct CardData {
     pub raw_payload: Vec<u8>,
 }
 
-pub struct NewcamdClient {
+pub struct Client {
+    ecm_tx: mpsc::Sender<EcmCommand>,
+    emm_tx: mpsc::Sender<EmmCommand>,
+    ecm_busy: AtomicBool,
+    default_caid: u16,
+    default_provider: u32,
+}
+
+pub struct Connection {
+    stream: TcpStream,
+    read_timeout: Duration,
+    msg_id: u16,
+    session_key: [u8; 16],
+    ecm_rx: mpsc::Receiver<EcmCommand>,
+    emm_rx: mpsc::Receiver<EmmCommand>,
+    pending_ecm: Option<PendingEcm>,
+    pub card_data: CardData,
+}
+
+struct EcmCommand {
+    sid: u16,
+    caid: u16,
+    provider: u32,
+    payload: Vec<u8>,
+    response_tx: oneshot::Sender<EcmResponse>,
+}
+
+struct EmmCommand {
+    sid: u16,
+    caid: u16,
+    provider: u32,
+    payload: Vec<u8>,
+}
+
+struct PendingEcm {
+    msg_id: u16,
+    response_tx: oneshot::Sender<EcmResponse>,
+}
+
+struct EcmBusyGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for EcmBusyGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+struct HandshakeState {
     stream: TcpStream,
     read_timeout: Duration,
     msg_id: u16,
     session_key: [u8; 16],
     default_caid: u16,
     default_provider: u32,
-    pub card_data: CardData,
+    card_data: CardData,
 }
 
-impl NewcamdClient {
-    pub async fn connect(config: NewcamdConfig) -> Result<Self> {
-        if config.username.is_empty() || config.password.is_empty() {
-            return Err(NewcamdError::InvalidData(
-                "username and password must not be empty".to_string(),
-            ));
-        }
+impl Client {
+    pub async fn connect(config: NewcamdConfig) -> Result<(Self, Connection)> {
+        let handshake = perform_handshake(config).await?;
+        let (ecm_tx, ecm_rx) = mpsc::channel(ECM_QUEUE_CAPACITY);
+        let (emm_tx, emm_rx) = mpsc::channel(EMM_QUEUE_CAPACITY);
 
-        let endpoint = format!("{}:{}", config.host, config.port);
-        let configured_caid = config.caid;
-        let configured_provider = config.provider;
-        let mut stream = timeout(config.connect_timeout, TcpStream::connect(endpoint))
-            .await
-            .map_err(|_| NewcamdError::Protocol("connect timeout"))??;
+        let client = Self {
+            ecm_tx,
+            emm_tx,
+            ecm_busy: AtomicBool::new(false),
+            default_caid: handshake.default_caid,
+            default_provider: handshake.default_provider,
+        };
 
-        let mut keymod = [0_u8; LOGIN_INIT_SEQ_LEN];
-        timeout(config.read_timeout, stream.read_exact(&mut keymod))
-            .await
-            .map_err(|_| NewcamdError::Protocol("timeout while reading server init sequence"))??;
+        let connection = Connection {
+            stream: handshake.stream,
+            read_timeout: handshake.read_timeout,
+            msg_id: handshake.msg_id,
+            session_key: handshake.session_key,
+            ecm_rx,
+            emm_rx,
+            pending_ecm: None,
+            card_data: handshake.card_data,
+        };
 
-        let login_key = derive_login_key(&config.des_key_14, &keymod)?;
-        let password_crypt = md5_crypt(&config.password, "abcdefgh");
-
-        let mut login_data = Vec::with_capacity(config.username.len() + password_crypt.len() + 2);
-        login_data.extend_from_slice(config.username.as_bytes());
-        login_data.push(0);
-        login_data.extend_from_slice(password_crypt.as_bytes());
-        login_data.push(0);
-
-        let login_payload = encode_payload(msg::MSG_CLIENT_2_SERVER_LOGIN, &login_data);
-        send_network_message(&mut stream, None, &login_key, &login_payload, 0, 0, 0).await?;
-
-        let login_answer = read_network_message(&mut stream, &login_key, config.read_timeout).await?;
-        let mut msg_id = login_answer.header.msg_id;
-
-        if login_answer.command == msg::MSG_CLIENT_2_SERVER_LOGIN_NAK {
-            return Err(NewcamdError::AuthenticationFailed);
-        }
-        if login_answer.command != msg::MSG_CLIENT_2_SERVER_LOGIN_ACK {
-            return Err(NewcamdError::Protocol("expected LOGIN_ACK packet"));
-        }
-
-        let session_key = derive_login_key(&config.des_key_14, password_crypt.as_bytes())?;
-        let card_data_req = encode_payload(msg::MSG_CARD_DATA_REQ, &[]);
-        send_network_message(
-            &mut stream,
-            Some(&mut msg_id),
-            &session_key,
-            &card_data_req,
-            0,
-            0,
-            0,
-        )
-        .await?;
-
-        let card_data_answer = read_network_message(&mut stream, &session_key, config.read_timeout).await?;
-        if card_data_answer.command != msg::MSG_CARD_DATA {
-            return Err(NewcamdError::Protocol("expected CARD_DATA packet"));
-        }
-
-        let caid = card_data_answer
-            .data
-            .get(3)
-            .zip(card_data_answer.data.get(4))
-            .map(|(hi, lo)| u16::from_be_bytes([*hi, *lo]))
-            .ok_or(NewcamdError::Protocol("invalid CARD_DATA payload"))?;
-
-        let provider_count = card_data_answer.data.get(14).copied().unwrap_or(0) as usize;
-        let default_caid = if configured_caid == 0 { caid } else { configured_caid };
-        let default_provider = configured_provider;
-
-        Ok(Self {
-            stream,
-            read_timeout: config.read_timeout,
-            msg_id,
-            session_key,
-            default_caid,
-            default_provider,
-            card_data: CardData {
-                caid,
-                provider_count,
-                raw_payload: card_data_answer.data,
-            },
-        })
+        Ok((client, connection))
     }
 
     pub fn default_caid(&self) -> u16 {
@@ -174,86 +170,49 @@ impl NewcamdClient {
         self.default_provider
     }
 
-    pub async fn send_raw(&mut self, command: u8, data: &[u8], req: RawRequest) -> Result<NewcamdPacket> {
-        let payload = encode_payload(command, data);
-        let caid = self.resolve_caid(req.caid);
-        let provider = self.resolve_provider(req.provider);
-        send_network_message(
-            &mut self.stream,
-            Some(&mut self.msg_id),
-            &self.session_key,
-            &payload,
-            req.sid,
-            caid,
-            provider,
-        )
-        .await?;
-
-        self.read_next_non_keepalive().await
-    }
-
-    pub async fn send_ecm(&mut self, req: &EcmRequest) -> Result<EcmResponse> {
+    pub async fn send_ecm(&self, req: &EcmRequest) -> Result<EcmResponse> {
         if req.section.len() < 3 {
             return Err(NewcamdError::InvalidData(
                 "ECM section must include at least 3 bytes".to_string(),
             ));
         }
 
+        if self
+            .ecm_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(NewcamdError::Protocol(
+                "previous ECM request is still pending",
+            ));
+        }
+
+        let _guard = EcmBusyGuard {
+            flag: &self.ecm_busy,
+        };
+
         let mut payload = req.section.clone();
         patch_payload_len(&mut payload);
-        let caid = self.resolve_caid(req.caid);
-        let provider = self.resolve_provider(req.provider);
+        let (response_tx, response_rx) = oneshot::channel();
+        let command = EcmCommand {
+            sid: req.sid,
+            caid: self.resolve_caid(req.caid),
+            provider: self.resolve_provider(req.provider),
+            payload,
+            response_tx,
+        };
 
-        send_network_message(
-            &mut self.stream,
-            Some(&mut self.msg_id),
-            &self.session_key,
-            &payload,
-            req.sid,
-            caid,
-            provider,
-        )
-        .await?;
+        self.ecm_tx
+            .send(command)
+            .await
+            .map_err(|_| NewcamdError::Protocol("connection task is not running"))?;
 
-        let sent_msg_id = self.msg_id;
-
-        loop {
-            let packet = self.read_next_non_keepalive().await?;
-            let is_ecm_response = packet.header.msg_id == sent_msg_id
-                || matches!(packet.command, 0x80 | 0x81);
-            if !is_ecm_response {
-                continue;
-            }
-
-            let mut cw = [0_u8; 16];
-            if packet.data.is_empty() {
-                return Ok(EcmResponse {
-                    found: false,
-                    cw,
-                    packet,
-                });
-            }
-
-            if packet.data.len() < 16 {
-                return Err(NewcamdError::Protocol("ECM response payload is shorter than 16-byte CW"));
-            }
-
-            cw.copy_from_slice(&packet.data[..16]);
-            return Ok(EcmResponse {
-                found: true,
-                cw,
-                packet,
-            });
-        }
+        response_rx
+            .await
+            .map_err(|_| NewcamdError::Protocol("ECM response channel was closed"))
     }
 
-    pub async fn send_emm(
-        &mut self,
-        section: &[u8],
-        sid: u16,
-        caid: u16,
-        provider: u32,
-    ) -> Result<Option<NewcamdPacket>> {
+    pub async fn send_emm(&self, section: &[u8], sid: u16, caid: u16, provider: u32) -> Result<()> {
         if section.len() < 3 {
             return Err(NewcamdError::InvalidData(
                 "EMM section must include at least 3 bytes".to_string(),
@@ -262,26 +221,17 @@ impl NewcamdClient {
 
         let mut payload = section.to_vec();
         patch_payload_len(&mut payload);
-        let caid = self.resolve_caid(caid);
-        let provider = self.resolve_provider(provider);
-
-        send_network_message(
-            &mut self.stream,
-            Some(&mut self.msg_id),
-            &self.session_key,
-            &payload,
+        let command = EmmCommand {
             sid,
-            caid,
-            provider,
-        )
-        .await?;
+            caid: self.resolve_caid(caid),
+            provider: self.resolve_provider(provider),
+            payload,
+        };
 
-        let packet = self.read_next_non_keepalive().await?;
-        if (0x82..0x90).contains(&packet.command) {
-            return Ok(Some(packet));
-        }
-
-        Ok(None)
+        self.emm_tx
+            .send(command)
+            .await
+            .map_err(|_| NewcamdError::Protocol("connection task is not running"))
     }
 
     fn resolve_caid(&self, request_caid: u16) -> u16 {
@@ -299,16 +249,222 @@ impl NewcamdClient {
             request_provider
         }
     }
+}
 
-    async fn read_next_non_keepalive(&mut self) -> Result<NewcamdPacket> {
+impl Connection {
+    pub async fn run(mut self) -> Result<()> {
         loop {
-            let packet = read_network_message(&mut self.stream, &self.session_key, self.read_timeout).await?;
-            if packet.command == msg::MSG_KEEPALIVE {
-                continue;
+            let ecm_timeout = self.pending_ecm.is_some().then_some(self.read_timeout);
+            tokio::select! {
+                biased;
+                packet = read_network_message(&mut self.stream, &self.session_key, ecm_timeout) => {
+                    let packet = packet?;
+                    self.handle_server_packet(packet).await?;
+                }
+                Some(command) = self.ecm_rx.recv() => {
+                    self.send_ecm_command(command).await?;
+                }
+                Some(command) = self.emm_rx.recv() => {
+                    self.send_emm_command(command).await?;
+                }
             }
-            return Ok(packet);
         }
     }
+
+    async fn handle_server_packet(&mut self, packet: NewcamdPacket) -> Result<()> {
+        if packet.command == msg::MSG_KEEPALIVE {
+            self.send_keepalive_response(&packet).await?;
+            return Ok(());
+        }
+
+        let should_consume_ecm = self
+            .pending_ecm
+            .as_ref()
+            .map(|pending| {
+                pending.msg_id == packet.header.msg_id || matches!(packet.command, 0x80 | 0x81)
+            })
+            .unwrap_or(false);
+
+        if !should_consume_ecm {
+            return Err(NewcamdError::Protocol("unexpected packet from server"));
+        }
+
+        let pending = self.pending_ecm.take().unwrap();
+        let response = decode_ecm_response(packet)?;
+        let _ = pending.response_tx.send(response);
+        Ok(())
+    }
+
+    async fn send_keepalive_response(&mut self, packet: &NewcamdPacket) -> Result<()> {
+        let payload = encode_payload(msg::MSG_KEEPALIVE, &[]);
+        let _ = send_network_message(
+            &mut self.stream,
+            Some(&mut self.msg_id),
+            &self.session_key,
+            &payload,
+            packet.header.sid,
+            packet.header.caid,
+            packet.header.provider,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn send_ecm_command(&mut self, command: EcmCommand) -> Result<()> {
+        if self.pending_ecm.is_some() {
+            return Err(NewcamdError::Protocol(
+                "received a new ECM while another is pending",
+            ));
+        }
+
+        let msg_id = send_network_message(
+            &mut self.stream,
+            Some(&mut self.msg_id),
+            &self.session_key,
+            &command.payload,
+            command.sid,
+            command.caid,
+            command.provider,
+        )
+        .await?;
+
+        self.pending_ecm = Some(PendingEcm {
+            msg_id,
+            response_tx: command.response_tx,
+        });
+
+        Ok(())
+    }
+
+    async fn send_emm_command(&mut self, command: EmmCommand) -> Result<()> {
+        let _ = send_network_message(
+            &mut self.stream,
+            Some(&mut self.msg_id),
+            &self.session_key,
+            &command.payload,
+            command.sid,
+            command.caid,
+            command.provider,
+        )
+        .await?;
+
+        Ok(())
+    }
+}
+
+async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
+    if config.username.is_empty() || config.password.is_empty() {
+        return Err(NewcamdError::InvalidData(
+            "username and password must not be empty".to_string(),
+        ));
+    }
+
+    let endpoint = format!("{}:{}", config.host, config.port);
+    let configured_caid = config.caid;
+    let configured_provider = config.provider;
+    let mut stream = timeout(config.connect_timeout, TcpStream::connect(endpoint))
+        .await
+        .map_err(|_| NewcamdError::Protocol("connect timeout"))??;
+
+    let mut keymod = [0_u8; LOGIN_INIT_SEQ_LEN];
+    timeout(config.read_timeout, stream.read_exact(&mut keymod))
+        .await
+        .map_err(|_| NewcamdError::Protocol("timeout while reading server init sequence"))??;
+
+    let login_key = derive_login_key(&config.des_key_14, &keymod)?;
+    let password_crypt = md5_crypt(&config.password, "abcdefgh");
+
+    let mut login_data = Vec::with_capacity(config.username.len() + password_crypt.len() + 2);
+    login_data.extend_from_slice(config.username.as_bytes());
+    login_data.push(0);
+    login_data.extend_from_slice(password_crypt.as_bytes());
+    login_data.push(0);
+
+    let login_payload = encode_payload(msg::MSG_CLIENT_2_SERVER_LOGIN, &login_data);
+    let _ = send_network_message(&mut stream, None, &login_key, &login_payload, 0, 0, 0).await?;
+
+    let login_answer = read_network_message(&mut stream, &login_key, Some(config.read_timeout)).await?;
+    let mut msg_id = login_answer.header.msg_id;
+
+    if login_answer.command == msg::MSG_CLIENT_2_SERVER_LOGIN_NAK {
+        return Err(NewcamdError::AuthenticationFailed);
+    }
+    if login_answer.command != msg::MSG_CLIENT_2_SERVER_LOGIN_ACK {
+        return Err(NewcamdError::Protocol("expected LOGIN_ACK packet"));
+    }
+
+    let session_key = derive_login_key(&config.des_key_14, password_crypt.as_bytes())?;
+    let card_data_req = encode_payload(msg::MSG_CARD_DATA_REQ, &[]);
+    let _ = send_network_message(
+        &mut stream,
+        Some(&mut msg_id),
+        &session_key,
+        &card_data_req,
+        0,
+        0,
+        0,
+    )
+    .await?;
+
+    let card_data_answer =
+        read_network_message(&mut stream, &session_key, Some(config.read_timeout)).await?;
+    if card_data_answer.command != msg::MSG_CARD_DATA {
+        return Err(NewcamdError::Protocol("expected CARD_DATA packet"));
+    }
+
+    let caid = card_data_answer
+        .data
+        .get(3)
+        .zip(card_data_answer.data.get(4))
+        .map(|(hi, lo)| u16::from_be_bytes([*hi, *lo]))
+        .ok_or(NewcamdError::Protocol("invalid CARD_DATA payload"))?;
+
+    let provider_count = card_data_answer.data.get(14).copied().unwrap_or(0) as usize;
+    let default_caid = if configured_caid == 0 {
+        caid
+    } else {
+        configured_caid
+    };
+    let default_provider = configured_provider;
+
+    Ok(HandshakeState {
+        stream,
+        read_timeout: config.read_timeout,
+        msg_id,
+        session_key,
+        default_caid,
+        default_provider,
+        card_data: CardData {
+            caid,
+            provider_count,
+            raw_payload: card_data_answer.data,
+        },
+    })
+}
+
+fn decode_ecm_response(packet: NewcamdPacket) -> Result<EcmResponse> {
+    let mut cw = [0_u8; 16];
+    if packet.data.is_empty() {
+        return Ok(EcmResponse {
+            found: false,
+            cw,
+            packet,
+        });
+    }
+
+    if packet.data.len() < 16 {
+        return Err(NewcamdError::Protocol(
+            "ECM response payload is shorter than 16-byte CW",
+        ));
+    }
+
+    cw.copy_from_slice(&packet.data[..16]);
+    Ok(EcmResponse {
+        found: true,
+        cw,
+        packet,
+    })
 }
 
 async fn send_network_message(
@@ -319,7 +475,7 @@ async fn send_network_message(
     sid: u16,
     caid: u16,
     provider: u32,
-) -> Result<()> {
+) -> Result<u16> {
     if payload.len() < 3 {
         return Err(NewcamdError::Protocol("payload must be at least 3 bytes"));
     }
@@ -356,33 +512,44 @@ async fn send_network_message(
 
     stream.write_all(&to_encrypt).await?;
 
-    Ok(())
+    Ok(current_msg_id)
 }
 
 async fn read_network_message(
     stream: &mut TcpStream,
     des_key: &[u8; 16],
-    read_timeout: Duration,
+    read_timeout: Option<Duration>,
 ) -> Result<NewcamdPacket> {
     let mut len_bytes = [0_u8; 2];
-    timeout(read_timeout, stream.read_exact(&mut len_bytes))
-        .await
-        .map_err(|_| NewcamdError::Protocol("timeout while reading packet length"))??;
+    if let Some(t) = read_timeout {
+        timeout(t, stream.read_exact(&mut len_bytes))
+            .await
+            .map_err(|_| NewcamdError::Protocol("timeout while reading packet length"))??;
+    } else {
+        stream.read_exact(&mut len_bytes).await?;
+    }
 
     let frame_len = u16::from_be_bytes(len_bytes) as usize;
     if frame_len + 2 > CWS_NETMSGSIZE {
-        return Err(NewcamdError::Protocol("received frame is larger than CWS_NETMSGSIZE"));
+        return Err(NewcamdError::Protocol(
+            "received frame is larger than CWS_NETMSGSIZE",
+        ));
     }
 
     let mut encrypted = vec![0_u8; frame_len + 2];
     encrypted[0] = len_bytes[0];
     encrypted[1] = len_bytes[1];
 
-    timeout(read_timeout, stream.read_exact(&mut encrypted[2..]))
-        .await
-        .map_err(|_| NewcamdError::Protocol("timeout while reading packet body"))??;
+    if let Some(t) = read_timeout {
+        timeout(t, stream.read_exact(&mut encrypted[2..]))
+            .await
+            .map_err(|_| NewcamdError::Protocol("timeout while reading packet body"))??;
+    } else {
+        stream.read_exact(&mut encrypted[2..]).await?;
+    }
 
     let plain_len = decrypt_message(&mut encrypted, des_key)?;
-    parse_decrypted_525(&encrypted[..plain_len])
-        .ok_or(NewcamdError::Protocol("failed to parse decrypted newcamd525 packet"))
+    parse_decrypted_525(&encrypted[..plain_len]).ok_or(NewcamdError::Protocol(
+        "failed to parse decrypted newcamd525 packet",
+    ))
 }
