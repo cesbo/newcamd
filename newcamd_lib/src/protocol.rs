@@ -9,6 +9,8 @@ pub mod msg {
     pub const MSG_CARD_DATA_REQ: u8 = 0xE3;
     pub const MSG_CARD_DATA: u8 = 0xE4;
     pub const MSG_KEEPALIVE: u8 = 0xFD;
+    /// DVB CA section table_id range used for EMM (ECM uses 0x80/0x81).
+    pub const EMM_TABLE_ID_RANGE: std::ops::RangeInclusive<u8> = 0x82..=0x8F;
 }
 
 #[derive(Debug, Clone, Copy)]

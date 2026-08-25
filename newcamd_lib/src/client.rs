@@ -286,6 +286,11 @@ impl Connection {
             return Ok(());
         }
 
+        if msg::EMM_TABLE_ID_RANGE.contains(&packet.command) {
+            // EMM packet received, but we don't have any EMM requests pending, so we just ignore it ???
+            return Ok(());
+        }
+
         let should_consume_ecm = self
             .pending_ecm
             .as_ref()
