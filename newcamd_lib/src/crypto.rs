@@ -1,16 +1,19 @@
+use des::Des;
 use des::cipher::generic_array::GenericArray;
 use des::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-use des::Des;
 use md5::{Digest, Md5};
 use rand::RngCore;
 
 use crate::error::{NewcamdError, Result};
 
-const MD5_CRYPT_B64: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const MD5_CRYPT_B64: &[u8; 64] =
+    b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 pub fn derive_login_key(key1: &[u8], key2: &[u8]) -> Result<[u8; 16]> {
     if key1.len() != 14 {
-        return Err(NewcamdError::InvalidData("newcamd key must be exactly 14 bytes".to_string()));
+        return Err(NewcamdError::InvalidData(
+            "newcamd key must be exactly 14 bytes".to_string(),
+        ));
     }
 
     let mut des14 = [0_u8; 14];
@@ -219,8 +222,10 @@ fn adjust_odd_parity(key: &mut [u8]) {
 }
 
 fn triple_des_hash_encrypt_block(block: &mut [u8], key: &[u8; 16]) -> Result<()> {
-    let k1 = Des::new_from_slice(&key[0..8]).map_err(|_| NewcamdError::Crypto("invalid DES key K1"))?;
-    let k2 = Des::new_from_slice(&key[8..16]).map_err(|_| NewcamdError::Crypto("invalid DES key K2"))?;
+    let k1 =
+        Des::new_from_slice(&key[0..8]).map_err(|_| NewcamdError::Crypto("invalid DES key K1"))?;
+    let k2 =
+        Des::new_from_slice(&key[8..16]).map_err(|_| NewcamdError::Crypto("invalid DES key K2"))?;
 
     let mut b = GenericArray::clone_from_slice(block);
     k1.encrypt_block(&mut b);
@@ -231,8 +236,10 @@ fn triple_des_hash_encrypt_block(block: &mut [u8], key: &[u8; 16]) -> Result<()>
 }
 
 fn triple_des_crypt_decrypt_block(block: &mut [u8], key: &[u8; 16]) -> Result<()> {
-    let k1 = Des::new_from_slice(&key[0..8]).map_err(|_| NewcamdError::Crypto("invalid DES key K1"))?;
-    let k2 = Des::new_from_slice(&key[8..16]).map_err(|_| NewcamdError::Crypto("invalid DES key K2"))?;
+    let k1 =
+        Des::new_from_slice(&key[0..8]).map_err(|_| NewcamdError::Crypto("invalid DES key K1"))?;
+    let k2 =
+        Des::new_from_slice(&key[8..16]).map_err(|_| NewcamdError::Crypto("invalid DES key K2"))?;
 
     let mut b = GenericArray::clone_from_slice(block);
     k1.decrypt_block(&mut b);
