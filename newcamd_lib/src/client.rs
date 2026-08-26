@@ -71,8 +71,17 @@ pub struct EcmResponse {
 #[derive(Debug, Clone)]
 pub struct CardData {
     pub caid: u16,
+    pub au: bool,
+    pub ua: [u8; 8],
+    pub providers: Vec<CardProvider>,
     pub provider_count: usize,
     pub raw_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CardProvider {
+    pub ident: [u8; 3],
+    pub sa: [u8; 8],
 }
 
 pub struct Client {
@@ -413,16 +422,42 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
         return Err(NewcamdError::Protocol("expected CARD_DATA packet"));
     }
 
-    let caid = card_data_answer
+    let card_caid = card_data_answer
         .data
-        .get(3)
-        .zip(card_data_answer.data.get(4))
-        .map(|(hi, lo)| u16::from_be_bytes([*hi, *lo]))
+        .get(1..3)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
         .ok_or(NewcamdError::Protocol("invalid CARD_DATA payload"))?;
 
-    let provider_count = card_data_answer.data.get(14).copied().unwrap_or(0) as usize;
+    let ua = card_data_answer
+        .data
+        .get(3..11)
+        .ok_or(NewcamdError::Protocol("invalid CARD_DATA payload"))?
+        .try_into()
+        .map_err(|_| NewcamdError::Protocol("invalid CARD_DATA payload"))?;
+
+    let provider_count = card_data_answer
+        .data
+        .get(11)
+        .copied()
+        .ok_or(NewcamdError::Protocol("invalid CARD_DATA payload"))?
+        as usize;
+    let provider_data = card_data_answer
+        .data
+        .get(12..)
+        .ok_or(NewcamdError::Protocol("invalid CARD_DATA payload"))?;
+    let providers = provider_data
+        .chunks_exact(11)
+        .take(provider_count)
+        .map(|entry| CardProvider {
+            ident: [entry[0], entry[1], entry[2]],
+            sa: entry[3..11].try_into().expect("provider entry has 8-byte SA"),
+        })
+        .collect::<Vec<_>>();
+    if providers.len() != provider_count {
+        return Err(NewcamdError::Protocol("invalid CARD_DATA provider data"));
+    }
     let default_caid = if configured_caid == 0 {
-        caid
+        card_caid
     } else {
         configured_caid
     };
@@ -436,7 +471,10 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
         default_caid,
         default_provider,
         card_data: CardData {
-            caid,
+            caid: default_caid,
+            au: card_data_answer.data[0] == 1,
+            ua,
+            providers,
             provider_count,
             raw_payload: card_data_answer.data,
         },

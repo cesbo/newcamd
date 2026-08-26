@@ -80,7 +80,15 @@ async fn main() -> anyhow::Result<()> {
         Ok((client, connection)) => {
             println!("Connected");
             println!("Card CAID: 0x{:04X}", connection.card_data.caid);
+            println!("Card AU: {}", if connection.card_data.au { "YES" } else { "NO" });
+            println!("Card UA: {:02X?}", connection.card_data.ua);
             println!("Providers: {}", connection.card_data.provider_count);
+            for provider in &connection.card_data.providers {
+                println!(
+                    "  PROVID: {:02X?}, SA: {:02X?}",
+                    provider.ident, provider.sa
+                );
+            }
 
             let connection_task = tokio::spawn(async move { connection.run().await });
 
