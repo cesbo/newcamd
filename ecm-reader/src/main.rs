@@ -53,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
 
     let oscam_host = "bg.cesbo.com".to_string();
     let oscam_port: u16 = 9201;
-    let caid: u16 = 0x09BD;
     let provider: u32 = 0;
     let sid: u16 = 1;
     let oscam_username = "test".to_string();
@@ -70,7 +69,6 @@ async fn main() -> anyhow::Result<()> {
         username: oscam_username,
         password: oscam_password,
         des_key_14,
-        caid,
         provider,
         connect_timeout: Duration::from_secs(5),
         read_timeout: Duration::from_secs(5),
@@ -90,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
+            let caid = connection.card_data.caid;
             let connection_task = tokio::spawn(async move { connection.run().await });
 
             let mut response = reqwest::get(&args.url).await?.error_for_status()?;
