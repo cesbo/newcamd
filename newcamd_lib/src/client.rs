@@ -24,7 +24,6 @@ pub struct NewcamdConfig {
     pub username: String,
     pub password: String,
     pub des_key_14: [u8; 14],
-    pub caid: u16,
     pub provider: u32,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
@@ -38,7 +37,6 @@ impl Default for NewcamdConfig {
             username: String::new(),
             password: String::new(),
             des_key_14: [0_u8; 14],
-            caid: 0,
             provider: 0,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(5),
@@ -88,7 +86,7 @@ pub struct Client {
     ecm_tx: mpsc::Sender<EcmCommand>,
     emm_tx: mpsc::Sender<EmmCommand>,
     ecm_busy: AtomicBool,
-    default_caid: u16,
+    caid: u16,
     default_provider: u32,
 }
 
@@ -138,7 +136,6 @@ struct HandshakeState {
     read_timeout: Duration,
     msg_id: u16,
     session_key: [u8; 16],
-    default_caid: u16,
     default_provider: u32,
     card_data: CardData,
 }
@@ -153,7 +150,7 @@ impl Client {
             ecm_tx,
             emm_tx,
             ecm_busy: AtomicBool::new(false),
-            default_caid: handshake.default_caid,
+            caid: handshake.card_data.caid,
             default_provider: handshake.default_provider,
         };
 
@@ -171,8 +168,8 @@ impl Client {
         Ok((client, connection))
     }
 
-    pub fn default_caid(&self) -> u16 {
-        self.default_caid
+    pub fn caid(&self) -> u16 {
+        self.caid
     }
 
     pub fn default_provider(&self) -> u32 {
@@ -245,7 +242,7 @@ impl Client {
 
     fn resolve_caid(&self, request_caid: u16) -> u16 {
         if request_caid == 0 {
-            self.default_caid
+            self.caid
         } else {
             request_caid
         }
@@ -375,7 +372,6 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
     }
 
     let endpoint = format!("{}:{}", config.host, config.port);
-    let configured_caid = config.caid;
     let configured_provider = config.provider;
     let mut stream = timeout(config.connect_timeout, TcpStream::connect(endpoint))
         .await
@@ -461,11 +457,6 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
     if providers.len() != provider_count {
         return Err(NewcamdError::Protocol("invalid CARD_DATA provider data"));
     }
-    let default_caid = if configured_caid == 0 {
-        card_caid
-    } else {
-        configured_caid
-    };
     let default_provider = configured_provider;
 
     Ok(HandshakeState {
@@ -473,10 +464,9 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
         read_timeout: config.read_timeout,
         msg_id,
         session_key,
-        default_caid,
         default_provider,
         card_data: CardData {
-            caid: default_caid,
+            caid: card_caid,
             au: card_data_answer.data[0] == 1,
             ua,
             providers,
