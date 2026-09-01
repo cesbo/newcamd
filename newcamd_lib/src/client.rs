@@ -297,7 +297,8 @@ impl Connection {
             .unwrap_or(false);
 
         if !should_consume_ecm {
-            return Err(NewcamdError::Protocol("unexpected packet from server"));
+            // Ignore unknown/unexpected packets to avoid connection interruptions
+            return Ok(());
         }
 
         let pending = self.pending_ecm.take().unwrap();
