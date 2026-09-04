@@ -98,6 +98,7 @@ pub struct Connection {
     ecm_rx: mpsc::Receiver<EcmCommand>,
     emm_rx: mpsc::Receiver<EmmCommand>,
     pending_ecm: Option<PendingEcm>,
+    input_buffer: Vec<u8>,
     pub card_data: CardData,
 }
 
@@ -162,6 +163,7 @@ impl Client {
             ecm_rx,
             emm_rx,
             pending_ecm: None,
+            input_buffer: Vec::with_capacity(CWS_NETMSGSIZE),
             card_data: handshake.card_data,
         };
 
@@ -260,12 +262,15 @@ impl Client {
 impl Connection {
     pub async fn run(mut self) -> Result<()> {
         loop {
+            while let Some(packet) = self.read_buffered_network_message()? {
+                self.handle_server_packet(packet).await?;
+            }
+
             let ecm_timeout = self.pending_ecm.is_some().then_some(self.read_timeout);
             tokio::select! {
                 biased;
-                packet = read_network_message(&mut self.stream, &self.session_key, ecm_timeout) => {
-                    let packet = packet?;
-                    self.handle_server_packet(packet).await?;
+                read = read_into_buffer(&mut self.stream, &mut self.input_buffer, ecm_timeout) => {
+                    read?;
                 }
                 Some(command) = self.ecm_rx.recv() => {
                     self.send_ecm_command(command).await?;
@@ -275,6 +280,16 @@ impl Connection {
                 }
             }
         }
+    }
+
+    fn read_buffered_network_message(&mut self) -> Result<Option<NewcamdPacket>> {
+        let Some(packet) =
+            parse_buffered_network_message(&mut self.input_buffer, &self.session_key)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(packet))
     }
 
     async fn handle_server_packet(&mut self, packet: NewcamdPacket) -> Result<()> {
@@ -297,7 +312,7 @@ impl Connection {
             .unwrap_or(false);
 
         if !should_consume_ecm {
-            // Ignore unknown/unexpected packets to avoid connection interruptions
+            // Unknown or unexpected packet, ignore it instead of killing the connection.
             return Ok(());
         }
 
@@ -395,7 +410,8 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
     let login_payload = encode_payload(msg::MSG_CLIENT_2_SERVER_LOGIN, &login_data);
     let _ = send_network_message(&mut stream, None, &login_key, &login_payload, 0, 0, 0).await?;
 
-    let login_answer = read_network_message(&mut stream, &login_key, Some(config.read_timeout)).await?;
+    let login_answer =
+        read_network_handshake_msg(&mut stream, &login_key, Some(config.read_timeout)).await?;
     let mut msg_id = login_answer.header.msg_id;
 
     if login_answer.command == msg::MSG_CLIENT_2_SERVER_LOGIN_NAK {
@@ -419,7 +435,7 @@ async fn perform_handshake(config: NewcamdConfig) -> Result<HandshakeState> {
     .await?;
 
     let card_data_answer =
-        read_network_message(&mut stream, &session_key, Some(config.read_timeout)).await?;
+        read_network_handshake_msg(&mut stream, &session_key, Some(config.read_timeout)).await?;
     if card_data_answer.command != msg::MSG_CARD_DATA {
         return Err(NewcamdError::Protocol("expected CARD_DATA packet"));
     }
@@ -549,41 +565,68 @@ async fn send_network_message(
     Ok(current_msg_id)
 }
 
-async fn read_network_message(
+async fn read_network_handshake_msg(
     stream: &mut TcpStream,
     des_key: &[u8; 16],
     read_timeout: Option<Duration>,
 ) -> Result<NewcamdPacket> {
-    let mut len_bytes = [0_u8; 2];
-    if let Some(t) = read_timeout {
-        timeout(t, stream.read_exact(&mut len_bytes))
+    let mut input_buffer = Vec::with_capacity(CWS_NETMSGSIZE);
+
+    loop {
+        if let Some(packet) = parse_buffered_network_message(&mut input_buffer, des_key)? {
+            return Ok(packet);
+        }
+
+        read_into_buffer(stream, &mut input_buffer, read_timeout).await?;
+    }
+}
+
+async fn read_into_buffer(
+    stream: &mut TcpStream,
+    input_buffer: &mut Vec<u8>,
+    read_timeout: Option<Duration>,
+) -> Result<()> {
+    let read = if let Some(timeout_duration) = read_timeout {
+        timeout(timeout_duration, stream.read_buf(input_buffer))
             .await
-            .map_err(|_| NewcamdError::Protocol("timeout while reading packet length"))??;
+            .map_err(|_| NewcamdError::Protocol("timeout while reading packet"))??
     } else {
-        stream.read_exact(&mut len_bytes).await?;
+        stream.read_buf(input_buffer).await?
+    };
+
+    if read == 0 {
+        return Err(NewcamdError::Protocol(
+            "connection closed while reading packet",
+        ));
     }
 
-    let frame_len = u16::from_be_bytes(len_bytes) as usize;
-    if frame_len + 2 > CWS_NETMSGSIZE {
+    Ok(())
+}
+
+fn parse_buffered_network_message(
+    input_buffer: &mut Vec<u8>,
+    des_key: &[u8; 16],
+) -> Result<Option<NewcamdPacket>> {
+    if input_buffer.len() < 2 {
+        return Ok(None);
+    }
+
+    let frame_len = u16::from_be_bytes([input_buffer[0], input_buffer[1]]) as usize;
+    let total_len = frame_len + 2;
+    if total_len > CWS_NETMSGSIZE {
         return Err(NewcamdError::Protocol(
             "received frame is larger than CWS_NETMSGSIZE",
         ));
     }
-
-    let mut encrypted = vec![0_u8; frame_len + 2];
-    encrypted[0] = len_bytes[0];
-    encrypted[1] = len_bytes[1];
-
-    if let Some(t) = read_timeout {
-        timeout(t, stream.read_exact(&mut encrypted[2..]))
-            .await
-            .map_err(|_| NewcamdError::Protocol("timeout while reading packet body"))??;
-    } else {
-        stream.read_exact(&mut encrypted[2..]).await?;
+    if input_buffer.len() < total_len {
+        return Ok(None);
     }
 
-    let plain_len = decrypt_message(&mut encrypted, des_key)?;
-    parse_decrypted_525(&encrypted[..plain_len]).ok_or(NewcamdError::Protocol(
+    let plain_len = decrypt_message(&mut input_buffer[..total_len], des_key)?;
+    let packet = parse_decrypted_525(&input_buffer[..plain_len]).ok_or(NewcamdError::Protocol(
         "failed to parse decrypted newcamd525 packet",
-    ))
+    ))?;
+    input_buffer.drain(..total_len);
+
+    Ok(Some(packet))
 }
