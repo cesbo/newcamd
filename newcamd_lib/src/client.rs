@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 use crate::crypto::{decrypt_message, derive_login_key, encrypt_message, md5_crypt};
 use crate::error::{NewcamdError, Result};
@@ -107,7 +107,7 @@ struct EcmCommand {
     caid: u16,
     provider: u32,
     payload: Vec<u8>,
-    response_tx: oneshot::Sender<EcmResponse>,
+    response_tx: oneshot::Sender<Result<EcmResponse>>,
 }
 
 struct EmmCommand {
@@ -119,7 +119,8 @@ struct EmmCommand {
 
 struct PendingEcm {
     msg_id: u16,
-    response_tx: oneshot::Sender<EcmResponse>,
+    deadline: Instant,
+    response_tx: oneshot::Sender<Result<EcmResponse>>,
 }
 
 struct EcmBusyGuard<'a> {
@@ -217,7 +218,7 @@ impl Client {
 
         response_rx
             .await
-            .map_err(|_| NewcamdError::Protocol("ECM response channel was closed"))
+            .map_err(|_| NewcamdError::Protocol("ECM response channel was closed"))?
     }
 
     pub async fn send_emm(&self, section: &[u8], sid: u16, caid: u16, provider: u32) -> Result<()> {
@@ -266,11 +267,13 @@ impl Connection {
                 self.handle_server_packet(packet).await?;
             }
 
-            let ecm_timeout = self.pending_ecm.is_some().then_some(self.read_timeout);
             tokio::select! {
-                biased;
-                read = read_into_buffer(&mut self.stream, &mut self.input_buffer, ecm_timeout) => {
+                read = read_into_buffer(&mut self.stream, &mut self.input_buffer, None) => {
                     read?;
+                }
+                () = tokio::time::sleep_until(self.pending_ecm.as_ref().map(|pending| pending.deadline).unwrap_or_else(Instant::now)), if self.pending_ecm.is_some() => {
+                    let pending = self.pending_ecm.take().expect("ECM is pending while its timeout branch is enabled");
+                    let _ = pending.response_tx.send(Err(NewcamdError::Protocol("timeout while waiting for ECM response")));
                 }
                 Some(command) = self.ecm_rx.recv() => {
                     self.send_ecm_command(command).await?;
@@ -306,9 +309,7 @@ impl Connection {
         let should_consume_ecm = self
             .pending_ecm
             .as_ref()
-            .map(|pending| {
-                pending.msg_id == packet.header.msg_id || matches!(packet.command, 0x80 | 0x81)
-            })
+            .map(|pending| pending.msg_id == packet.header.msg_id)
             .unwrap_or(false);
 
         if !should_consume_ecm {
@@ -317,7 +318,7 @@ impl Connection {
         }
 
         let pending = self.pending_ecm.take().unwrap();
-        let response = decode_ecm_response(packet)?;
+        let response = decode_ecm_response(packet);
         let _ = pending.response_tx.send(response);
         Ok(())
     }
@@ -358,6 +359,7 @@ impl Connection {
 
         self.pending_ecm = Some(PendingEcm {
             msg_id,
+            deadline: Instant::now() + self.read_timeout,
             response_tx: command.response_tx,
         });
 
